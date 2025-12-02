@@ -30,15 +30,31 @@ st.set_page_config(
     layout="wide",
 )
 
+# =========================
+# 1. DATA LOADING & CLEANING
+# =========================
 
-# =========================
-# 1. LOAD DATA & TRAIN MODELS
-# =========================
+def remove_outliers_iqr(df: pd.DataFrame, cols) -> pd.DataFrame:
+    """
+    Remove outliers using the IQR rule for the given columns.
+    This helps avoid crazy values like 15h of sleep, 12h of study, etc.
+    """
+    clean_df = df.copy()
+    for col in cols:
+        Q1 = clean_df[col].quantile(0.25)
+        Q3 = clean_df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        lower = Q1 - 1.5 * IQR
+        upper = Q3 + 1.5 * IQR
+        clean_df = clean_df[(clean_df[col] >= lower) & (clean_df[col] <= upper)]
+    return clean_df
+
 
 @st.cache_data
 def load_data() -> pd.DataFrame:
     """
-    Load the student lifestyle dataset from the same folder as this app.
+    Load the student lifestyle dataset from the same folder as this app
+    and remove extreme outliers in hour-based columns.
     """
     csv_path = Path(__file__).parent / "student_lifestyle_dataset.csv"
 
@@ -46,8 +62,25 @@ def load_data() -> pd.DataFrame:
         st.error(f"File not found: {csv_path}")
         st.stop()
 
-    return pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path)
 
+    hour_cols = [
+        "Study_Hours_Per_Day",
+        "Extracurricular_Hours_Per_Day",
+        "Sleep_Hours_Per_Day",
+        "Social_Hours_Per_Day",
+        "Physical_Activity_Hours_Per_Day",
+    ]
+
+    # Clean outliers
+    df = remove_outliers_iqr(df, hour_cols)
+
+    return df
+
+
+# =========================
+# 2. MODEL TRAINING
+# =========================
 
 @st.cache_resource
 def train_models(df: pd.DataFrame):
@@ -114,7 +147,7 @@ def train_models(df: pd.DataFrame):
         xgb.fit(X_train, y_train)
         models["XGBoost"] = xgb
 
-    # Ranges used for sliders & recommendation logic
+    # Stats for sliders and target GPA
     stats = {
         "min_study": float(df["Study_Hours_Per_Day"].min()),
         "max_study": float(df["Study_Hours_Per_Day"].max()),
@@ -137,7 +170,7 @@ def train_models(df: pd.DataFrame):
 
 
 # =========================
-# 2. RECOMMENDATION ENGINE
+# 3. RECOMMENDATION ENGINE (JOINT OPTIMIZATION)
 # =========================
 
 def generate_recommendations(
@@ -145,157 +178,174 @@ def generate_recommendations(
     base_pred: float,
     model,
     stats: dict,
-    n_steps: int = 10,
+    target_gpa=None,
+    n_candidates: int = 400,
 ) -> pd.DataFrame:
     """
-    Try a RANGE of realistic changes to each habit (not fixed +1.5 only) and
-    estimate how much each change could improve predicted GPA.
+    Jointly optimize ALL habits at once.
 
-    For each habit, we:
-    - Sample several possible new values between current and min/max
-    - Pick the one that gives the highest predicted GPA
-    - Keep the change if it improves GPA by > 0.01
+    Strategy:
+    - Start from the user's current lifestyle.
+    - Randomly sample candidate lifestyles around it (changing multiple habits).
+    - Enforce realistic bounds for each habit.
+    - Enforce a 24-hour total time constraint.
+    - Predict GPA for all candidates.
+    - Rank candidates based on:
+        * if target_gpa is None: largest GPA increase
+        * if target_gpa is set: closest to target while still improving
+    - Return a few best combined lifestyle plans.
     """
 
+    base_row = base_input.iloc[0].copy()
+
+    # Reasonable "human" bounds (you can tune these)
+    safe_ranges = {
+        "Study_Hours_Per_Day": (0.5, 8.0),
+        "Sleep_Hours_Per_Day": (5.0, 9.0),
+        "Extracurricular_Hours_Per_Day": (0.0, 5.0),
+        "Social_Hours_Per_Day": (0.0, 6.0),
+        "Physical_Activity_Hours_Per_Day": (0.0, 4.0),
+    }
+
+    # Helper: sample a new continuous value around current, within bounds, 0.5h steps
+    def sample_continuous(col_name, current):
+        low, high = safe_ranges[col_name]
+        # random shift between -2 and +2 hours
+        delta = np.random.uniform(-2.0, 2.0)
+        val = current + delta
+        val = max(low, min(high, val))
+        # snap to nearest 0.5 hours
+        return round(val * 2) / 2.0
+
+    # Stress: discrete levels
+    current_stress = int(base_row["Stress_Level_Encoded"])
+    min_stress = stats["min_stress_encoded"]
+    max_stress = stats["max_stress_encoded"]
+
     candidates = []
-    row = base_input.copy()
 
-    # ---------- Helper for continuous habits ----------
-    def search_best_continuous_change(
-        col_name: str,
-        increasing: bool,
-        lower_bound: float,
-        upper_bound: float,
-        desc_label: str,
-        min_delta: float = 0.01,
-    ):
-        current_val = float(row[col_name].iloc[0])
-        best_val = None
-        best_pred = base_pred
+    # --- 1. Generate candidate lifestyles ---
+    for _ in range(n_candidates):
+        cand = base_row.copy()
 
-        if increasing:
-            if upper_bound <= current_val:
-                return
-            # Sample between current and upper_bound
-            values = np.linspace(current_val, upper_bound, n_steps + 1)[1:]
-        else:
-            if lower_bound >= current_val:
-                return
-            # Sample between lower_bound and current (going down)
-            values = np.linspace(lower_bound, current_val, n_steps + 1)[:-1]
-
-        for v in values:
-            tmp = row.copy()
-            tmp[col_name] = v
-            new_pred = float(model.predict(tmp)[0])
-            if new_pred > best_pred + 1e-6:
-                best_pred = new_pred
-                best_val = v
-
-        if best_val is not None and (best_pred - base_pred) > min_delta:
-            if increasing:
-                desc = (
-                    f"Increase {desc_label} from {current_val:.1f}h "
-                    f"to {best_val:.1f}h per day."
-                )
-            else:
-                desc = (
-                    f"Reduce {desc_label} from {current_val:.1f}h "
-                    f"to {best_val:.1f}h per day."
-                )
-
-            candidates.append({
-                "habit": desc_label.title(),
-                "description": desc,
-                "new_pred": best_pred,
-                "delta_gpa": best_pred - base_pred,
-            })
-
-    # 1. Study hours: try increasing up to max_study
-    search_best_continuous_change(
-        col_name="Study_Hours_Per_Day",
-        increasing=True,
-        lower_bound=stats["min_study"],
-        upper_bound=stats["max_study"],
-        desc_label="study time",
-    )
-
-    # 2. Sleep: aim between current (or 7h, whichever is higher) and max_sleep
-    current_sleep = float(row["Sleep_Hours_Per_Day"].iloc[0])
-    sleep_start = max(current_sleep, 7.0)
-    if sleep_start < stats["max_sleep"]:
-        search_best_continuous_change(
-            col_name="Sleep_Hours_Per_Day",
-            increasing=True,
-            lower_bound=sleep_start,
-            upper_bound=stats["max_sleep"],
-            desc_label="sleep",
+        # Continuous habits (sample around current)
+        cand["Study_Hours_Per_Day"] = sample_continuous(
+            "Study_Hours_Per_Day",
+            base_row["Study_Hours_Per_Day"],
+        )
+        cand["Sleep_Hours_Per_Day"] = sample_continuous(
+            "Sleep_Hours_Per_Day",
+            base_row["Sleep_Hours_Per_Day"],
+        )
+        cand["Extracurricular_Hours_Per_Day"] = sample_continuous(
+            "Extracurricular_Hours_Per_Day",
+            base_row["Extracurricular_Hours_Per_Day"],
+        )
+        cand["Social_Hours_Per_Day"] = sample_continuous(
+            "Social_Hours_Per_Day",
+            base_row["Social_Hours_Per_Day"],
+        )
+        cand["Physical_Activity_Hours_Per_Day"] = sample_continuous(
+            "Physical_Activity_Hours_Per_Day",
+            base_row["Physical_Activity_Hours_Per_Day"],
         )
 
-    # 3. Physical activity: aim between max(current, 1h) and max_phys
-    current_phys = float(row["Physical_Activity_Hours_Per_Day"].iloc[0])
-    phys_start = max(current_phys, 1.0)
-    if phys_start < stats["max_phys"]:
-        search_best_continuous_change(
-            col_name="Physical_Activity_Hours_Per_Day",
-            increasing=True,
-            lower_bound=phys_start,
-            upper_bound=stats["max_phys"],
-            desc_label="physical activity",
+        # Stress: bias toward equal or lower stress
+        possible_stress = list(range(min_stress, max_stress + 1))
+        # Favor values <= current_stress
+        if np.random.rand() < 0.7:
+            possible_stress = [s for s in possible_stress if s <= current_stress]
+        if not possible_stress:
+            possible_stress = [current_stress]
+        cand["Stress_Level_Encoded"] = int(np.random.choice(possible_stress))
+
+        # 24h constraint
+        total_hours = (
+            cand["Study_Hours_Per_Day"]
+            + cand["Sleep_Hours_Per_Day"]
+            + cand["Extracurricular_Hours_Per_Day"]
+            + cand["Social_Hours_Per_Day"]
+            + cand["Physical_Activity_Hours_Per_Day"]
         )
+        if total_hours > 24:
+            continue
 
-    # 4. Social time: try decreasing towards min_social
-    search_best_continuous_change(
-        col_name="Social_Hours_Per_Day",
-        increasing=False,
-        lower_bound=stats["min_social"],
-        upper_bound=stats["max_social"],
-        desc_label="social time",
-    )
+        candidates.append(cand)
 
-    # 5. Extracurricular time: try decreasing towards min_extra
-    search_best_continuous_change(
-        col_name="Extracurricular_Hours_Per_Day",
-        increasing=False,
-        lower_bound=stats["min_extra"],
-        upper_bound=stats["max_extra"],
-        desc_label="extracurricular time",
-    )
-
-    # 6. Stress level: discrete levels (integers)
-    current_stress = int(row["Stress_Level_Encoded"].iloc[0])
-    if current_stress > stats["min_stress_encoded"]:
-        best_level = None
-        best_pred = base_pred
-
-        for level in range(current_stress - 1, stats["min_stress_encoded"] - 1, -1):
-            tmp = row.copy()
-            tmp["Stress_Level_Encoded"] = level
-            new_pred = float(model.predict(tmp)[0])
-            if new_pred > best_pred + 1e-6:
-                best_pred = new_pred
-                best_level = level
-
-        if best_level is not None and (best_pred - base_pred) > 0.01:
-            candidates.append({
-                "habit": "Stress level",
-                "description": "Work on reducing your stress level (e.g. from High → Medium).",
-                "new_pred": best_pred,
-                "delta_gpa": best_pred - base_pred,
-            })
-
-    # No candidates at all
     if not candidates:
         return pd.DataFrame(columns=["habit", "description", "new_pred", "delta_gpa"])
 
-    # Convert to DataFrame, sort, and return
-    rec_df = pd.DataFrame(candidates)
-    rec_df = rec_df.sort_values("delta_gpa", ascending=False)
+    cand_df = pd.DataFrame(candidates)
+
+    # --- 2. Predict GPA for all candidates ---
+    preds = model.predict(cand_df[base_input.columns])
+    cand_df["pred_gpa"] = preds
+    cand_df["delta_gpa"] = cand_df["pred_gpa"] - base_pred
+
+    # Keep only lifestyle plans that improve GPA meaningfully
+    cand_df = cand_df[cand_df["delta_gpa"] > 0.01]
+    if cand_df.empty:
+        return pd.DataFrame(columns=["habit", "description", "new_pred", "delta_gpa"])
+
+    # --- 3. Rank candidates ---
+    if target_gpa is not None:
+        cand_df["dist_to_target"] = np.abs(cand_df["pred_gpa"] - target_gpa)
+        cand_df = cand_df.sort_values(
+            ["dist_to_target", "delta_gpa"],
+            ascending=[True, False],
+        )
+    else:
+        cand_df = cand_df.sort_values("delta_gpa", ascending=False)
+
+    # --- 4. Convert candidates to human-readable plans ---
+    recs = []
+    for _, row in cand_df.head(5).iterrows():
+        changes = []
+
+        def add_change(name, label, unit="h"):
+            old = float(base_row[name])
+            new = float(row[name])
+            if abs(new - old) >= 0.25:  # only mention real changes
+                direction = "Increase" if new > old else "Reduce"
+                changes.append(
+                    f"{direction} {label} from {old:.1f}{unit} to {new:.1f}{unit} per day"
+                )
+
+        add_change("Study_Hours_Per_Day", "study time")
+        add_change("Sleep_Hours_Per_Day", "sleep")
+        add_change("Extracurricular_Hours_Per_Day", "extracurricular time")
+        add_change("Social_Hours_Per_Day", "social time")
+        add_change("Physical_Activity_Hours_Per_Day", "physical activity")
+
+        new_stress = int(row["Stress_Level_Encoded"])
+        if new_stress < current_stress:
+            changes.append(
+                "Work on lowering your stress level (e.g. better time management, relaxation)."
+            )
+
+        if not changes:
+            continue
+
+        description = "; ".join(changes)
+        recs.append({
+            "habit": "Combined lifestyle plan",
+            "description": description,
+            "new_pred": float(row["pred_gpa"]),
+            "delta_gpa": float(row["delta_gpa"]),
+        })
+
+    if not recs:
+        return pd.DataFrame(columns=["habit", "description", "new_pred", "delta_gpa"])
+
+    rec_df = pd.DataFrame(recs)
+    if target_gpa is None:
+        rec_df = rec_df.sort_values("delta_gpa", ascending=False)
+
     return rec_df
 
 
 # =========================
-# 3. VISUALIZATION HELPERS
+# 4. VISUALIZATION HELPERS
 # =========================
 
 def plot_feature_importance(model, feature_names, model_name: str):
@@ -406,7 +456,7 @@ def correlation_heatmap(df: pd.DataFrame):
 
 
 # =========================
-# 4. STREAMLIT UI
+# 5. STREAMLIT UI
 # =========================
 
 def main():
@@ -417,8 +467,8 @@ def main():
         This tool uses machine learning models trained on student lifestyle data to:
 
         - **Predict your GPA** based on your daily habits  
-        - Suggest **small, realistic changes** that may improve your predicted GPA  
-        - Let you set a **target GPA** and see which lifestyle changes move you closer to it  
+        - Suggest **combined lifestyle changes** (study, sleep, social, etc.)  
+        - Let you set a **target GPA** and see which plans move you toward it  
 
         Use the controls on the left to describe a typical day.
         """
@@ -517,7 +567,7 @@ def main():
     }
     input_df = pd.DataFrame(input_dict)
 
-    # Init session state for pred_gpa and target_gpa
+    # Init session state
     if "pred_gpa" not in st.session_state:
         st.session_state["pred_gpa"] = None
     if "target_gpa" not in st.session_state:
@@ -528,15 +578,44 @@ def main():
         ["My GPA & Advice", "🎯 Target GPA Planner", "Dataset & Model"]
     )
 
+    # ----- TAB 2 FIRST: TARGET GPA PLANNER -----
+    with tab_target:
+        st.subheader("🎯 Target GPA Planner")
+
+        st.markdown(
+            """
+            Use this tab to choose a **goal GPA** you want to aim for.  
+            The prediction tab will then tell you how far you are from this goal and
+            how each recommended lifestyle plan moves you toward it.
+            """
+        )
+
+        current_target = st.session_state.get("target_gpa", stats["mean_gpa"])
+
+        new_target = st.slider(
+            "Choose your goal GPA",
+            stats["min_gpa"],
+            stats["max_gpa"],
+            float(current_target),
+            step=0.1,
+        )
+
+        st.session_state["target_gpa"] = float(new_target)
+
+        st.info(
+            f"Your current target GPA is set to **{new_target:.2f}**. "
+            "Go to **'My GPA & Advice'** and run the prediction to see "
+            "how close you are and which lifestyle plans help you get there."
+        )
+
     # ----- TAB 1: MAIN PREDICTION + ADVICE -----
     with tab_pred:
         st.subheader("Predicted GPA")
 
-        # Current target GPA from session
         target_gpa = st.session_state.get("target_gpa", stats["mean_gpa"])
 
         # Two-column layout (left: prediction, right: summary)
-        col_left, col_right = st.columns([1.2, 1])
+        col_left, col_right = st.columns([1.3, 1])
 
         with col_left:
             if st.button("Predict my GPA"):
@@ -562,22 +641,22 @@ def main():
                     )
 
                 st.markdown("---")
-                st.subheader("Habit suggestions")
+                st.subheader("Lifestyle plans to move toward your goal")
 
                 rec_df = generate_recommendations(
                     base_input=input_df,
                     base_pred=pred_gpa,
                     model=selected_model,
                     stats=stats,
+                    target_gpa=target_gpa,
                 )
 
                 if rec_df.empty:
                     st.info(
-                        "No strong recommendations found – your current habits already look close to optimal."
+                        "No strong improvement plans found – your current habits already look close to optimal "
+                        "under this model."
                     )
                 else:
-                    st.write("These changes could **increase** your predicted GPA and move you toward your goal:")
-
                     for _, row_rec in rec_df.head(3).iterrows():
                         new_pred = row_rec["new_pred"]
                         delta = row_rec["delta_gpa"]
@@ -585,25 +664,25 @@ def main():
 
                         if gap_after <= 0:
                             goal_msg = (
-                                f"This change would **reach or exceed your goal** "
+                                f"✅ This plan would **reach or exceed your goal** "
                                 f"(new GPA {new_pred:.2f}, overshoot {abs(gap_after):.2f})."
                             )
                         else:
                             goal_msg = (
-                                f"You would still be **{gap_after:.2f} points below** your goal "
+                                f"📉 After this plan, you would still be **{gap_after:.2f} points below** your goal "
                                 f"(new GPA {new_pred:.2f})."
                             )
 
                         st.markdown(
-                            f"- **{row_rec['habit']}:** {row_rec['description']}  \n"
-                            f"  ↳ GPA change: **+{delta:.2f}** → **{new_pred:.2f}**  \n"
+                            f"- **Plan:** {row_rec['description']}  \n"
+                            f"  ↳ Predicted GPA change: **+{delta:.2f}** → **{new_pred:.2f}**  \n"
                             f"  {goal_msg}"
                         )
 
-                    st.caption("These are model-based estimates, not guarantees.")
+                    st.caption("These are model-based estimates from observational data, not guarantees.")
 
             else:
-                st.info("Click **'Predict my GPA'** to see results.")
+                st.info("Click **'Predict my GPA'** to see results and lifestyle plans.")
 
         with col_right:
             st.markdown("#### Quick summary of your current day")
@@ -631,9 +710,7 @@ def main():
                 )
             )
 
-        # ---------------------------------------
-        # CENTERED GPA DISTRIBUTION CHART
-        # ---------------------------------------
+        # GPA distribution + radar only if we already predicted
         pred_gpa = st.session_state.get("pred_gpa", None)
         if pred_gpa is not None:
             st.markdown("<br><h3 style='text-align:center;'> Where do you sit in the class?</h3>",
@@ -667,36 +744,6 @@ def main():
                 "</div>",
                 unsafe_allow_html=True
             )
-
-    # ----- TAB 2: TARGET GPA PLANNER -----
-    with tab_target:
-        st.subheader("🎯 Target GPA Planner")
-
-        st.markdown(
-            """
-            Use this tab to choose a **goal GPA** you want to aim for.  
-            The prediction tab will then tell you how far you are from this goal and
-            how each recommended change moves you toward it.
-            """
-        )
-
-        current_target = st.session_state.get("target_gpa", stats["mean_gpa"])
-
-        new_target = st.slider(
-            "Choose your goal GPA",
-            stats["min_gpa"],
-            stats["max_gpa"],
-            float(current_target),
-            step=0.1,
-        )
-
-        st.session_state["target_gpa"] = float(new_target)
-
-        st.info(
-            f"Your current target GPA is set to **{new_target:.2f}**. "
-            "Go back to **'My GPA & Advice'** and run the prediction to see "
-            "how close you are to this goal."
-        )
 
     # ----- TAB 3: DATASET & MODEL -----
     with tab_data:
@@ -742,7 +789,7 @@ def main():
         f"Currently selected: **{selected_model_name}**."
     )
     if not XGBOOST_AVAILABLE:
-        st.caption("XGBoost is not installed in this environment, so only Linear Regression and Random Forest are available.")
+        st.caption("XGBoost is not installed in this environment, so only Linear Regression and Random Forest may be available.")
 
 
 if __name__ == "__main__":
