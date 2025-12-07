@@ -1,5 +1,3 @@
-# app.py
-
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -20,6 +18,7 @@ try:
 except ImportError:
     XGBOOST_AVAILABLE = False
 
+
 # =========================
 # 0. BASIC PAGE CONFIG
 # =========================
@@ -29,6 +28,7 @@ st.set_page_config(
     page_icon="🎓",
     layout="wide",
 )
+
 
 # =========================
 # 1. DATA LOADING & CLEANING
@@ -372,9 +372,12 @@ def plot_feature_importance(model, feature_names, model_name: str):
     st.pyplot(fig)
 
 
-def radar_chart(user_df: pd.DataFrame, df: pd.DataFrame):
+def radar_chart(user_df: pd.DataFrame, df: pd.DataFrame, target_gpa: float | None = None):
     """
-    Radar chart: user profile vs dataset average (for main lifestyle habits).
+    Radar chart:
+    - User profile
+    - Typical profile of students whose GPA is close to the chosen target GPA
+      (or dataset average if no suitable group is found).
     """
     categories = [
         "Study_Hours_Per_Day",
@@ -385,7 +388,29 @@ def radar_chart(user_df: pd.DataFrame, df: pd.DataFrame):
     ]
 
     user_values = [float(user_df[c].iloc[0]) for c in categories]
-    avg_values = [float(df[c].mean()) for c in categories]
+
+    # Select comparison group: students with GPA near target_gpa
+    if target_gpa is not None:
+        # First try a narrow band ±0.1
+        band = 0.1
+        subset = df[np.abs(df["GPA"] - target_gpa) <= band]
+
+        # If empty, gradually widen band up to ±0.4
+        while subset.empty and band <= 0.4:
+            band += 0.1
+            subset = df[np.abs(df["GPA"] - target_gpa) <= band]
+
+        # If still empty, fall back to nearest 50 students
+        if subset.empty:
+            nearest_idx = (df["GPA"] - target_gpa).abs().sort_values().index[:50]
+            subset = df.loc[nearest_idx]
+
+        comp_label = f"Typical habits (GPA ≈ {target_gpa:.2f})"
+    else:
+        subset = df
+        comp_label = "Dataset average"
+
+    avg_values = [float(subset[c].mean()) for c in categories]
 
     fig = go.Figure()
 
@@ -402,7 +427,7 @@ def radar_chart(user_df: pd.DataFrame, df: pd.DataFrame):
         r=avg_values,
         theta=categories,
         fill='toself',
-        name='Dataset average',
+        name=comp_label,
         fillcolor='rgba(255, 153, 0, 0.3)',
         line=dict(color='rgba(255, 153, 0, 1)', width=3)
     ))
@@ -538,6 +563,7 @@ def main():
             step=0.5,
         )
 
+        # Stress level
         stress_options = sorted(df["Stress_Level"].unique().tolist())
         default_stress_index = 0
         if "Medium" in stress_options:
@@ -549,6 +575,23 @@ def main():
             index=default_stress_index,
         )
         stress_encoded = int(stress_encoder.transform([stress_level])[0])
+
+        # ---- 24-hour constraint for user's daily plan ----
+        total_hours = (
+            study_hours
+            + sleep_hours
+            + extra_hours
+            + social_hours
+            + phys_hours
+        )
+
+        st.markdown(f"**Total hours used:** {total_hours:.1f} / 24 h")
+
+        if total_hours > 24:
+            st.error(
+                "Total of study, sleep, extracurricular, social and physical activity "
+                "exceeds **24 hours**. Please adjust your plan to fit within one day."
+            )
 
         st.markdown("---")
         st.caption(
@@ -574,112 +617,101 @@ def main():
         st.session_state["target_gpa"] = stats["mean_gpa"]
 
     # ========== MAIN CONTENT: TABS ==========
-    tab_pred, tab_target, tab_data = st.tabs(
-        ["My GPA & Advice", "🎯 Target GPA Planner", "Dataset & Model"]
+    tab_pred, tab_data = st.tabs(
+        ["My GPA, Target & Advice", "Dataset & Model"]
     )
 
-    # ----- TAB 2 FIRST: TARGET GPA PLANNER -----
-    with tab_target:
-        st.subheader("🎯 Target GPA Planner")
+    # ----- MAIN TAB: PREDICTION + TARGET PLANNER -----
+    with tab_pred:
+        st.subheader("Predicted GPA & Target Planner")
 
-        st.markdown(
-            """
-            Use this tab to choose a **goal GPA** you want to aim for.  
-            The prediction tab will then tell you how far you are from this goal and
-            how each recommended lifestyle plan moves you toward it.
-            """
-        )
-
+        # Target GPA slider now lives here
         current_target = st.session_state.get("target_gpa", stats["mean_gpa"])
-
-        new_target = st.slider(
+        target_gpa = st.slider(
             "Choose your goal GPA",
             stats["min_gpa"],
             stats["max_gpa"],
             float(current_target),
             step=0.1,
+            help="This is the GPA you would like to aim for."
         )
+        st.session_state["target_gpa"] = float(target_gpa)
 
-        st.session_state["target_gpa"] = float(new_target)
-
-        st.info(
-            f"Your current target GPA is set to **{new_target:.2f}**. "
-            "Go to **'My GPA & Advice'** and run the prediction to see "
-            "how close you are and which lifestyle plans help you get there."
+        st.caption(
+            f"Your current target GPA is set to **{target_gpa:.2f}**. "
+            "The prediction and lifestyle plans below are evaluated relative to this goal."
         )
-
-    # ----- TAB 1: MAIN PREDICTION + ADVICE -----
-    with tab_pred:
-        st.subheader("Predicted GPA")
-
-        target_gpa = st.session_state.get("target_gpa", stats["mean_gpa"])
 
         # Two-column layout (left: prediction, right: summary)
         col_left, col_right = st.columns([1.3, 1])
 
         with col_left:
             if st.button("Predict my GPA"):
-                pred_gpa = float(selected_model.predict(input_df)[0])
-                st.session_state["pred_gpa"] = pred_gpa
-
-                st.metric(
-                    label=f"Estimated GPA ({selected_model_name})",
-                    value=f"{pred_gpa:.2f}",
-                    help="Prediction based on your current daily habits and chosen model."
-                )
-
-                gap = target_gpa - pred_gpa
-                st.write(f"🎯 **Your target GPA (from Planner tab):** {target_gpa:.2f}")
-                if gap <= 0:
-                    st.success(
-                        f"Your predicted GPA already meets or exceeds your target "
-                        f"(by {-gap:.2f} points). Focus on maintaining healthy habits!"
+                # Stop if user hours are impossible
+                if total_hours > 24:
+                    st.error(
+                        "Your current plan exceeds 24 hours in a day. "
+                        "Please reduce some activities before running the prediction."
                     )
                 else:
-                    st.info(
-                        f"You are currently **{gap:.2f} GPA points below** your target."
+                    pred_gpa = float(selected_model.predict(input_df)[0])
+                    st.session_state["pred_gpa"] = pred_gpa
+
+                    st.metric(
+                        label=f"Estimated GPA ({selected_model_name})",
+                        value=f"{pred_gpa:.2f}",
+                        help="Prediction based on your current daily habits and chosen model."
                     )
 
-                st.markdown("---")
-                st.subheader("Lifestyle plans to move toward your goal")
-
-                rec_df = generate_recommendations(
-                    base_input=input_df,
-                    base_pred=pred_gpa,
-                    model=selected_model,
-                    stats=stats,
-                    target_gpa=target_gpa,
-                )
-
-                if rec_df.empty:
-                    st.info(
-                        "No strong improvement plans found – your current habits already look close to optimal "
-                        "under this model."
-                    )
-                else:
-                    for _, row_rec in rec_df.head(3).iterrows():
-                        new_pred = row_rec["new_pred"]
-                        delta = row_rec["delta_gpa"]
-                        gap_after = target_gpa - new_pred
-
-                        if gap_after <= 0:
-                            goal_msg = (
-                                f"✅ This plan would **reach or exceed your goal** "
-                                f"(new GPA {new_pred:.2f}, overshoot {abs(gap_after):.2f})."
-                            )
-                        else:
-                            goal_msg = (
-                                f"📉 After this plan, you would still be **{gap_after:.2f} points below** your goal "
-                                f"(new GPA {new_pred:.2f})."
-                            )
-
-                        st.markdown(
-                            f"- **Plan:** {row_rec['description']}  \n"
-                            f"  ↳ Predicted GPA change: **+{delta:.2f}** → **{new_pred:.2f}**  \n"
-                            f"  {goal_msg}"
+                    gap = target_gpa - pred_gpa
+                    st.write(f"**Your target GPA:** {target_gpa:.2f}")
+                    if gap <= 0:
+                        st.success(
+                            f"Your predicted GPA already meets or exceeds your target "
+                            f"(by {-gap:.2f} points). Focus on maintaining healthy habits!"
+                        )
+                    else:
+                        st.info(
+                            f"You are currently **{gap:.2f} GPA points below** your target."
                         )
 
-                    st.caption("These are model-based estimates from observational data, not guarantees.")
+                    st.markdown("---")
+                    st.subheader("Lifestyle plans to move toward your goal")
+
+                    rec_df = generate_recommendations(
+                        base_input=input_df,
+                        base_pred=pred_gpa,
+                        model=selected_model,
+                        stats=stats,
+                        target_gpa=target_gpa,
+                    )
+
+                    if rec_df.empty:
+                        st.info("Your current habits already look close to optimal.")
+                    else:
+                        for _, row_rec in rec_df.head(3).iterrows():
+                            new_pred = row_rec["new_pred"]
+                            delta = row_rec["delta_gpa"]
+                            gap_after = target_gpa - new_pred
+
+                            if gap_after <= 0:
+                                goal_msg = (
+                                    f"This plan would **reach or exceed your goal** "
+                                    f"(new GPA {new_pred:.2f}, overshoot {abs(gap_after):.2f})."
+                                )
+                            else:
+                                goal_msg = (
+                                    f"After this plan, you would still be **{gap_after:.2f} points below** your goal "
+                                    f"(new GPA {new_pred:.2f})."
+                                )
+
+                            st.markdown(
+                                f"- **Plan:** {row_rec['description']}  \n"
+                                f"  ↳ Predicted GPA change: **+{delta:.2f}** → **{new_pred:.2f}**  \n"
+                                f"  {goal_msg}"
+                            )
+
+                        st.caption("These are model-based estimates from observational data, not guarantees.")
 
             else:
                 st.info("Click **'Predict my GPA'** to see results and lifestyle plans.")
@@ -734,18 +766,19 @@ def main():
 
             st.markdown("<div style='display:flex; justify-content:center;'>",
                         unsafe_allow_html=True)
-            radar_chart(input_df, df)
+            radar_chart(input_df, df, target_gpa=target_gpa)
             st.markdown("</div>", unsafe_allow_html=True)
 
             st.caption(
                 "<div style='text-align:center;'>"
-                "The radar chart compares **your lifestyle** with the dataset average.<br>"
+                "The radar chart compares **your lifestyle** with typical habits of students "
+                "whose GPA is close to your chosen target.<br>"
                 "Larger distance from the center = higher value for that habit."
                 "</div>",
                 unsafe_allow_html=True
             )
 
-    # ----- TAB 3: DATASET & MODEL -----
+    # ----- TAB 2: DATASET & MODEL -----
     with tab_data:
         st.subheader("Dataset snapshot")
 
